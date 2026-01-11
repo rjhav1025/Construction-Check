@@ -1,0 +1,257 @@
+---
+title: "Practicum CCheck"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-06-22"
+---
+
+```{r}
+library(readxl)
+library(data.table)
+library(caret)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(nnet)
+```
+
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+ccheckdata <- read.csv('final_data.csv')
+
+```
+
+Remove variables that do not have predictive power and remove NaNs from the area cost factors variable and total project cost variable
+
+```{r}
+
+new_cc_data <- subset(ccheckdata, select = -c(project_id, project_city))
+new_cc_data <- new_cc_data[!is.na(new_cc_data$total_project_cost),]
+new_cc_data <- new_cc_data[!is.na(new_cc_data$acf_2023),]
+
+```
+
+Remove outliers, normalize response variable, remove original response variable
+
+```{r}
+
+new_cc_data <- new_cc_data[(new_cc_data$total_project_cost != max(new_cc_data$total_project_cost)),]
+new_cc_data$log_total_project_cost <- log(new_cc_data$total_project_cost)
+ggplot(new_cc_data, aes(x = log_total_project_cost)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Histogram of Total Project Cost",
+       x = "Log Total Project Cost",
+       y = "Count") +
+  theme_minimal()
+
+new_cc_data$total_project_cost <- NULL
+
+```
+Summarize data and find features that have too few levels. In this case, we're analyzing the project type variable.
+```{r}
+table(new_cc_data$type)
+
+level_counts <- table(new_cc_data$type)
+
+# Identify levels with 5 or fewer observations
+rare_levels <- names(level_counts[level_counts <= 5])
+
+# Count how many rows belong to these rare levels
+num_rare_obs <- sum(new_cc_data$type %in% rare_levels)
+
+cat("Number of observations with rare levels (<5):", num_rare_obs)
+
+filtered_data <- new_cc_data[!(new_cc_data$type %in% rare_levels), ]
+```
+Summarize data and find features that have too few levels. In this case, we're analyzing the project state variable.
+```{r}
+table(filtered_data$project_state)
+
+level_counts <- table(filtered_data$project_state)
+
+# Identify levels with 5 or fewer observations
+rare_levels <- names(level_counts[level_counts <= 3])
+
+# Count how many rows belong to these rare levels
+num_rare_obs <- sum(filtered_data$project_state %in% rare_levels)
+
+cat("Number of observations with rare levels (<3):", num_rare_obs)
+
+filtered_data <- filtered_data[!(filtered_data$project_state %in% rare_levels), ]
+```
+
+remove predictor that does not vary
+```{r}
+filtered_data$cost_div_46 <- NULL
+
+```
+
+Split data into training and testing
+
+```{r}
+set.seed(1)
+train_indices <- createDataPartition(filtered_data$log_total_project_cost, p = 0.8, list = FALSE)
+train_data <- filtered_data[train_indices, ]
+test_data <- filtered_data[-train_indices, ]
+
+```
+Train decision tree
+
+Note: This model is not used in our final report. 
+```{r}
+tree_model <- rpart(log_total_project_cost ~ ., data = train_data,
+                    method = "anova")
+```
+Plot the tree
+```{r}
+rpart.plot(tree_model, main = "Decision Tree for Project Cost")
+summary(tree_model)
+```
+
+Build the prediction
+```{r}
+predictions <- predict(tree_model, newdata = test_data)
+predictions <- exp(predictions)
+
+```
+
+Evaluate Decision Tree Model Performance
+```{r}
+MAE <- mean(abs(predictions - exp(test_data$log_total_project_cost)))
+RMSE <- sqrt(mean((predictions - exp(test_data$log_total_project_cost))^2))
+cat("MAE:", MAE, "RMSE:", RMSE)
+
+```
+
+Develop Random Forest
+```{r}
+rf_model <- randomForest(
+  log_total_project_cost ~ .,
+  data = train_data,
+  ntree = 500,         # Number of trees
+  mtry = 3,            # Number of variables randomly sampled at each split (can tune this)
+  importance = TRUE    # Enables feature importance output
+)
+
+```
+
+Print Random Forest results 
+```{r}
+print(rf_model)
+
+```
+Find the most important variables 
+```{r}
+importance(rf_model)
+varImpPlot(rf_model)
+
+```
+Predict using random forest 
+```{r}
+predictions <- predict(rf_model, newdata = test_data)
+predictions <- exp(predictions)
+```
+Evaluate random forest model
+
+```{r}
+true_values <- exp(test_data$log_total_project_cost)
+MAE <- mean(abs(predictions - true_values))
+RMSE <- sqrt(mean((predictions - true_values)^2))
+
+
+# R-squared
+SS_res <- sum((true_values - predictions)^2)
+SS_tot <- sum((true_values - mean(true_values))^2)
+R2 <- 1 - (SS_res / SS_tot)
+
+# Print results
+cat("MAE:", round(MAE, 2), "\n")
+cat("RMSE:", round(RMSE, 2), "\n")
+cat("R-squared:", round(R2, 4), "\n")
+
+
+```
+
+Normalize predictors to use in Neural Network model
+
+```{r}
+train_nn <- train_data
+test_nn <- test_data
+factor_cols <- c("project_state", "type", "project_category", "construction_category")
+
+train_nn[factor_cols] <- lapply(train_nn[factor_cols], as.factor)
+for (col in factor_cols) {
+  test_nn[[col]] <- factor(test_nn[[col]], levels = levels(train_nn[[col]]))
+}
+
+# Identify numeric predictors (excluding target and factors)
+numeric_cols <- setdiff(names(train_nn), c("log_total_project_cost", factor_cols))
+
+# Scale numeric columns using training set statistics
+train_nn[numeric_cols] <- scale(train_nn[numeric_cols])
+
+# Scale test set using same stats
+center_vals <- attr(scale(train_data[numeric_cols]), "scaled:center")
+scale_vals  <- attr(scale(train_data[numeric_cols]), "scaled:scale")
+test_nn[numeric_cols] <- scale(test_nn[numeric_cols], center = center_vals, scale = scale_vals)
+```
+
+
+```{r}
+train_nn <- na.omit(train_nn)
+test_nn  <- na.omit(test_nn)
+
+```
+
+Train Neural Network
+
+```{r}
+set.seed(42)
+nn_model <- nnet(
+  log_total_project_cost ~ ., 
+  data = train_nn, 
+  size = 1,        # Number of hidden units
+  linout = TRUE,   # Regression (not classification)
+  maxit = 1000      # Max iterations
+)
+
+```
+Predict and evaluate neural network
+```{r}
+# Predict log(cost)
+log_preds <- predict(nn_model, newdata = test_nn)
+
+# Convert back to original scale
+preds <- exp(log_preds)
+actual <- exp(test_nn$log_total_project_cost)
+
+# Performance metrics
+MAE <- mean(abs(preds - actual))
+RMSE <- sqrt(mean((preds - actual)^2))
+
+# R-squared
+SS_res <- sum((actual - preds)^2)
+SS_tot <- sum((actual - mean(actual))^2)
+R2 <- 1 - (SS_res / SS_tot)
+
+cat("MAE:", round(MAE, 2), "\n")
+cat("RMSE:", round(RMSE, 2), "\n")
+cat("R-squared:", round(R2, 4), "\n")
+
+```
+
+Put results together
+```{r}
+results_df <- data.frame(
+  Actual = exp(test_data$log_total_project_cost),  
+  Predicted_rf = predictions,                     
+  Predicted_nn = preds                               
+)
+
+
+```
+
